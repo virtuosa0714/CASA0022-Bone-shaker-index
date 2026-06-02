@@ -36,6 +36,10 @@ dependencies:
   csv: ^6.0.0          # 用于生成 CSV 格式字符串
   path_provider: ^2.1.2 # 用于获取手机存储路径
   share_plus: ^10.1.0   # 用于弹出系统分享，把文件发到电脑或微信
+  flutter_map: ^6.1.0      # 开源地图组件
+  latlong2: ^0.9.0         # 经纬度计算包
+  file_picker: ^8.0.0      # 文件选择器 (用于导入CSV)
+  shared_preferences: ^2.2.3  # 用于存储用户设置和偏好
 
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.

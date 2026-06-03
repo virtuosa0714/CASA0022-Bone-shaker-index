@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bone-Shaker Cloud Dashboard</title>
+
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+    <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-app.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-firestore.js"></script>
+
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: sans-serif;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+        }
+
+        #header {
+            background-color: #263238;
+            color: white;
+            padding: 15px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
+        }
+
+        #header h1 {
+            margin: 0;
+            font-size: 20px;
+        }
+
+        .controls {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .btn {
+            padding: 8px 15px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-weight: bold;
+            color: white;
+            transition: 0.2s;
+        }
+
+        .btn-upload {
+            background-color: #3f51b5;
+        }
+
+        .btn-upload:hover {
+            background-color: #303f9f;
+        }
+
+        .btn-clear {
+            background-color: #d32f2f;
+        }
+
+        .btn-clear:hover {
+            background-color: #b71c1c;
+        }
+
+        #csvFileInput {
+            display: none;
+        }
+
+        #map {
+            flex: 1;
+            width: 100%;
+        }
+
+        .legend {
+            background: white;
+            padding: 10px;
+            border-radius: 5px;
+            box-shadow: 0 1px 5px rgba(0, 0, 0, 0.4);
+            font-size: 14px;
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 5px;
+        }
+
+        .dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+
+        #sync-status {
+            font-size: 13px;
+            color: #4CAF50;
+            font-weight: bold;
+            background: rgba(255, 255, 255, 0.1);
+            padding: 5px 10px;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+
+<body>
+
+    <div id="header">
+        <h1>☁️ Bone-Shaker Cloud Dashboard</h1>
+        <div class="controls">
+            <span id="sync-status">🟢 Live Sync Active</span>
+            <button class="btn btn-upload" onclick="document.getElementById('csvFileInput').click()">📂 Upload Ride
+                CSV</button>
+            <button class="btn btn-clear" onclick="clearCloudMap()">🗑️ Clear Cloud Data</button>
+            <input type="file" id="csvFileInput" accept=".csv" onchange="handleFileUpload(event)">
+        </div>
+    </div>
+
+    <div id="map"></div>
+
+    <script>
+        // ================= 1. 初始化 Firebase =================
+        const firebaseConfig = {
+            apiKey: "AIzaSyDuNN0dClnYs9atOrwdhBlmBWIRnRcNXxg",
+            authDomain: "boneshaker-cloud.firebaseapp.com",
+            projectId: "boneshaker-cloud",
+            storageBucket: "boneshaker-cloud.firebasestorage.app",
+            messagingSenderId: "642805589117",
+            appId: "1:642805589117:web:afa31003e17fedeafafd14",
+            measurementId: "G-65LLHV6424"
+        };
+
+        // 避免重复初始化报错
+        if (!firebase.apps.length) {
+            firebase.initializeApp(firebaseConfig);
+        }
+        const db = firebase.firestore();
+
+        // ================= 2. 初始化地图 =================
+        const map = L.map('map').setView([51.536, -0.012], 15);
+        L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '&copy; OpenStreetMap contributors'
+        }).addTo(map);
+
+        const legend = L.control({ position: 'bottomright' });
+        legend.onAdd = function () {
+            const div = L.DomUtil.create('div', 'legend');
+            div.innerHTML = `
+                <div class="legend-item"><span class="dot" style="background: red;"></span> Severe Bump (>= 0.45g)</div>
+                <div class="legend-item"><span class="dot" style="background: orange;"></span> Moderate Bump (>= 0.30g)</div>
+                <div class="legend-item"><div style="width:12px; height:3px; background:blue; display:inline-block;"></div> Route</div>
+            `;
+            return div;
+        };
+        legend.addTo(map);
+
+        let mapLayers = L.featureGroup().addTo(map);
+
+        // ================= 3. 实时云端监听 =================
+        db.collection("rides").onSnapshot((snapshot) => {
+            mapLayers.clearLayers();
+            let allRoutePoints = [];
+
+            snapshot.forEach((doc) => {
+                const data = doc.data();
+
+                // 【修复核心1】画这趟骑行的轨迹：将 Firebase 中的对象数组转换回 Leaflet 能读的嵌套数组
+                if (data.route && data.route.length > 0) {
+                    const safeRoute = data.route.map(p => [p.lat, p.lng]);
+                    L.polyline(safeRoute, { color: '#2196F3', weight: 4, opacity: 0.7 }).addTo(mapLayers);
+                    allRoutePoints = allRoutePoints.concat(safeRoute);
+                }
+
+                // 画这趟骑行的坑洼点
+                if (data.bumps && data.bumps.length > 0) {
+                    data.bumps.forEach(b => {
+                        const icon = b.type === 'severe' ? { radius: 8, color: 'red', fill: '#ff0000' } : { radius: 5, color: 'orange', fill: '#ffa500' };
+                        L.circleMarker([b.lat, b.lng], {
+                            radius: icon.radius, color: icon.color, fillColor: icon.fill, fillOpacity: 0.8, weight: 1
+                        }).bindPopup(`<b>${b.type === 'severe' ? 'Severe Bump' : 'Moderate Bump'}</b><br>Impact: ${b.impact}g`).addTo(mapLayers);
+                    });
+                }
+            });
+
+            // 自动缩放视角包含全城所有数据
+            if (allRoutePoints.length > 0) {
+                const combinedLine = L.polyline(allRoutePoints);
+                map.fitBounds(combinedLine.getBounds(), { padding: [50, 50] });
+            }
+        }, (error) => {
+            console.error("Snapshot Error:", error);
+            document.getElementById('sync-status').innerText = "🔴 Sync Error (Check Rules)";
+            document.getElementById('sync-status').style.color = "red";
+        });
+
+        // ================= 4. 处理 CSV 并推送到云端 =================
+        function handleFileUpload(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const statusUI = document.getElementById('sync-status');
+            statusUI.innerText = "⏳ Uploading to Cloud...";
+            statusUI.style.color = "orange";
+
+            const reader = new FileReader();
+            reader.onload = function (e) {
+                const rows = e.target.result.split(/\r?\n/);
+                let routePoints = [];
+                let bumps = [];
+
+                // 解析 CSV 数据
+                for (let i = 1; i < rows.length; i++) {
+                    const cols = rows[i].split(',');
+                    if (cols.length >= 6) {
+                        const accZ = parseFloat(cols[3]);
+                        const lat = parseFloat(cols[4]);
+                        const lng = parseFloat(cols[5]);
+
+                        // 过滤无效数据和 0.0 坐标
+                        if (!isNaN(lat) && !isNaN(lng) && lat !== 0 && lng !== 0) {
+                            // 【修复核心2】保存为对象格式而不是嵌套数组，解决 Firebase 报错
+                            routePoints.push({ lat: lat, lng: lng });
+
+                            const dynamicZ = Math.abs(Math.abs(accZ) - 0.98);
+                            if (dynamicZ >= 0.45) bumps.push({ lat: lat, lng: lng, impact: dynamicZ.toFixed(2), type: 'severe' });
+                            else if (dynamicZ >= 0.30) bumps.push({ lat: lat, lng: lng, impact: dynamicZ.toFixed(2), type: 'moderate' });
+                        }
+                    }
+                }
+
+                if (routePoints.length === 0) {
+                    alert("No valid data found in CSV!");
+                    statusUI.innerText = "🔴 Upload Failed";
+                    statusUI.style.color = "red";
+                    return;
+                }
+
+                // 推送一趟完整的 Ride 数据到 Firebase
+                db.collection("rides").add({
+                    timestamp: new Date().toISOString(),
+                    route: routePoints,
+                    bumps: bumps
+                }).then(() => {
+                    statusUI.innerText = "🟢 Live Sync Active";
+                    statusUI.style.color = "#4CAF50";
+                    alert("Upload Successful!");
+                }).catch(error => {
+                    console.error("Firebase Upload Error: ", error);
+                    statusUI.innerText = "🔴 Upload Failed";
+                    statusUI.style.color = "red";
+                    alert("Upload failed! Error: " + error.message);
+                });
+
+                // 重置上传框
+                event.target.value = '';
+            };
+            reader.readAsText(file);
+        }
+
+        // ================= 5. 清除云端所有数据 =================
+        function clearCloudMap() {
+            if (confirm("Are you sure you want to delete ALL ride data from the cloud? This affects all connected devices.")) {
+                const statusUI = document.getElementById('sync-status');
+                statusUI.innerText = "⏳ Deleting from Cloud...";
+                statusUI.style.color = "orange";
+
+                // 获取所有 rides 文档并批量删除
+                db.collection("rides").get().then((querySnapshot) => {
+                    let batch = db.batch();
+                    querySnapshot.forEach((doc) => {
+                        batch.delete(doc.ref);
+                    });
+                    return batch.commit();
+                }).then(() => {
+                    statusUI.innerText = "🟢 Live Sync Active";
+                    statusUI.style.color = "#4CAF50";
+                }).catch(error => {
+                    console.error("Clear Error: ", error);
+                    statusUI.innerText = "🔴 Delete Failed";
+                    statusUI.style.color = "red";
+                    alert("Delete failed! Check console.");
+                });
+            }
+        }
+    </script>
+</body>
+
+</html>

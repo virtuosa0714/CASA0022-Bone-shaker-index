@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "642805589117",
+    "project_id": "boneshaker-cloud",
+    "storage_bucket": "boneshaker-cloud.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:642805589117:android:a82b9a257dc7052dfafd14",
+        "android_client_info": {
+          "package_name": "com.example.boneshaker"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDr61Bb1J73fEyi7I6NYsKSb9eSzvLzWi8"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

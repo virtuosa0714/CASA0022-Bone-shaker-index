@@ -10,19 +10,30 @@ import 'package:csv/csv.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 
-// 地图与文件读取依赖
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:file_picker/file_picker.dart';
-// 新增的本地缓存依赖
-import 'package:shared_preferences/shared_preferences.dart';
 
-void main() => runApp(
-  const MaterialApp(
-    home: SensorDisplayApp(),
-    debugShowCheckedModeBanner: false,
-  ),
-);
+// --- Firebase 核心依赖 ---
+import 'package:firebase_core/firebase_core.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+
+// 注意：这里没有引入 firebase_options.dart，因为你使用了 google-services.json 手动配置
+
+void main() async {
+  // 必须先初始化 Flutter 引擎
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // 初始化 Firebase (安卓会自动读取 android/app/google-services.json)
+  await Firebase.initializeApp();
+
+  runApp(
+    const MaterialApp(
+      home: SensorDisplayApp(),
+      debugShowCheckedModeBanner: false,
+    ),
+  );
+}
 
 class SensorDisplayApp extends StatefulWidget {
   const SensorDisplayApp({super.key});
@@ -34,6 +45,7 @@ class SensorDisplayApp extends StatefulWidget {
 class _SensorDisplayAppState extends State<SensorDisplayApp> {
   String accelData = "Waiting for BLE...";
   String gpsData = "Fetching GPS...";
+  String syncStatus = "🟢 Live Sync Active";
 
   bool _isRecording = false;
   final List<List<dynamic>> _dataLog = [];
@@ -43,9 +55,9 @@ class _SensorDisplayAppState extends State<SensorDisplayApp> {
 
   final MapController _mapController = MapController();
 
-  // --- 持久化地图状态 ---
+  // --- 地图渲染数据 ---
   List<LatLng> _routePoints = [];
-  List<Map<String, dynamic>> _bumpData = []; // 用于存储可序列化的坑洼数据
+  List<Map<String, dynamic>> _bumpData = [];
 
   final String serviceUuid = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
   final String txUuid = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
@@ -57,74 +69,89 @@ class _SensorDisplayAppState extends State<SensorDisplayApp> {
   }
 
   Future<void> _startSystem() async {
-    await _loadMapState(); // 第一步：先读取本地缓存的地图数据
+    _listenToCloudData(); // 启动实时云端监听
     await _requestPermissions();
     _initGps();
     _initBluetooth();
   }
 
-  // ================= 1. 数据持久化逻辑 =================
+  // ================= 1. 实时云端监听 =================
+  void _listenToCloudData() {
+    FirebaseFirestore.instance.collection('rides').snapshots().listen((
+      snapshot,
+    ) {
+      List<LatLng> allRoutes = [];
+      List<Map<String, dynamic>> allBumps = [];
 
-  // 保存当前地图数据到手机本地
-  Future<void> _saveMapState() async {
-    final prefs = await SharedPreferences.getInstance();
+      for (var doc in snapshot.docs) {
+        var data = doc.data();
 
-    // 保存轨迹线
-    List<Map<String, double>> routeJson = _routePoints
-        .map((p) => {'lat': p.latitude, 'lng': p.longitude})
-        .toList();
-    await prefs.setString('saved_route', jsonEncode(routeJson));
+        // 解析云端轨迹
+        if (data['route'] != null) {
+          for (var pt in data['route']) {
+            allRoutes.add(LatLng(pt['lat'] + 0.0, pt['lng'] + 0.0));
+          }
+        }
 
-    // 保存坑洼点
-    await prefs.setString('saved_bumps', jsonEncode(_bumpData));
-  }
-
-  // 从手机本地读取地图数据
-  Future<void> _loadMapState() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-
-      String? routeStr = prefs.getString('saved_route');
-      if (routeStr != null) {
-        List<dynamic> decoded = jsonDecode(routeStr);
-        _routePoints = decoded.map((e) => LatLng(e['lat'], e['lng'])).toList();
+        // 解析云端坑洼点
+        if (data['bumps'] != null) {
+          for (var b in data['bumps']) {
+            allBumps.add({
+              'lat': b['lat'] + 0.0,
+              'lng': b['lng'] + 0.0,
+              'type': b['type'],
+            });
+          }
+        }
       }
 
-      String? bumpsStr = prefs.getString('saved_bumps');
-      if (bumpsStr != null) {
-        List<dynamic> decoded = jsonDecode(bumpsStr);
-        _bumpData = decoded.map((e) => Map<String, dynamic>.from(e)).toList();
+      setState(() {
+        _routePoints = allRoutes;
+        _bumpData = allBumps;
+      });
+
+      // 如果有数据且不在录制中，自动移动视角到第一个点
+      if (_routePoints.isNotEmpty && !_isRecording) {
+        _mapController.move(_routePoints.first, 16.0);
       }
-
-      // 如果有保存的数据，将地图初始中心点设为轨迹的起点
-      if (_routePoints.isNotEmpty) {
-        _currentLat = _routePoints.first.latitude;
-        _currentLng = _routePoints.first.longitude;
-      }
-
-      setState(() {});
-    } catch (e) {
-      print("Load Map State Error: $e");
-    }
-  }
-
-  // 清除地图上的所有数据
-  Future<void> _clearMapState() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove('saved_route');
-    await prefs.remove('saved_bumps');
-
-    setState(() {
-      _routePoints.clear();
-      _bumpData.clear();
     });
+  }
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text('Map data cleared!'),
-        backgroundColor: Colors.red,
-      ),
-    );
+  // 清除云端数据
+  Future<void> _clearCloudData() async {
+    bool confirm =
+        await showDialog(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text("Clear Cloud Data?"),
+            content: const Text(
+              "This will delete ALL rides from the cloud. Are you sure?",
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text("CANCEL"),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text(
+                  "DELETE",
+                  style: TextStyle(color: Colors.red),
+                ),
+              ),
+            ],
+          ),
+        ) ??
+        false;
+
+    if (!confirm) return;
+
+    setState(() => syncStatus = "⏳ Deleting...");
+    var snapshots = await FirebaseFirestore.instance.collection('rides').get();
+    for (var doc in snapshots.docs) {
+      await doc.reference.delete();
+    }
+    setState(() => syncStatus = "🟢 Live Sync Active");
   }
 
   // ======================================================
@@ -165,6 +192,7 @@ class _SensorDisplayAppState extends State<SensorDisplayApp> {
             "Lat: ${_currentLat.toStringAsFixed(5)}\nLong: ${_currentLng.toStringAsFixed(5)}";
 
         if (_isRecording) {
+          // 录制时仅在本地临时显示，录制结束后统一传云端
           _routePoints.add(LatLng(_currentLat, _currentLng));
           _mapController.move(LatLng(_currentLat, _currentLng), 17.0);
         }
@@ -175,7 +203,6 @@ class _SensorDisplayAppState extends State<SensorDisplayApp> {
   void _initBluetooth() async {
     if (await FlutterBluePlus.adapterState.first != BluetoothAdapterState.on)
       return;
-
     FlutterBluePlus.startScan(timeout: const Duration(seconds: 15));
     FlutterBluePlus.scanResults.listen((results) async {
       for (ScanResult r in results) {
@@ -224,7 +251,6 @@ class _SensorDisplayAppState extends State<SensorDisplayApp> {
         valX = rawAccel;
       }
     } catch (e) {}
-
     _dataLog.add([
       now.toIso8601String(),
       valX,
@@ -235,7 +261,8 @@ class _SensorDisplayAppState extends State<SensorDisplayApp> {
     ]);
   }
 
-  Future<void> _importCsvAndPlot() async {
+  // ================= 处理 CSV 并上传云端 =================
+  Future<void> _importCsvAndUploadToCloud() async {
     try {
       FilePickerResult? result = await FilePicker.platform.pickFiles(
         type: FileType.custom,
@@ -243,13 +270,14 @@ class _SensorDisplayAppState extends State<SensorDisplayApp> {
       );
 
       if (result != null) {
+        setState(() => syncStatus = "⏳ Uploading...");
         File file = File(result.files.single.path!);
         final csvString = await file.readAsString();
         List<List<dynamic>> rowsAsListOfValues = const CsvToListConverter()
             .convert(csvString);
 
-        List<LatLng> importedRoute = [];
-        List<Map<String, dynamic>> importedBumps = [];
+        List<Map<String, double>> uploadRoute = [];
+        List<Map<String, dynamic>> uploadBumps = [];
 
         for (int i = 1; i < rowsAsListOfValues.length; i++) {
           var row = rowsAsListOfValues[i];
@@ -259,48 +287,59 @@ class _SensorDisplayAppState extends State<SensorDisplayApp> {
             double lng = double.tryParse(row[5].toString()) ?? 0.0;
 
             if (lat == 0.0 && lng == 0.0) continue;
-            LatLng point = LatLng(lat, lng);
 
-            if (importedRoute.isEmpty || importedRoute.last != point) {
-              importedRoute.add(point);
-            }
+            uploadRoute.add({'lat': lat, 'lng': lng});
 
             double dynamicZ = (accZ.abs() - 0.98).abs();
-
             if (dynamicZ >= 0.45) {
-              importedBumps.add({'lat': lat, 'lng': lng, 'type': 'severe'});
+              uploadBumps.add({
+                'lat': lat,
+                'lng': lng,
+                'impact': dynamicZ.toStringAsFixed(2),
+                'type': 'severe',
+              });
             } else if (dynamicZ >= 0.30 && dynamicZ < 0.45) {
-              importedBumps.add({'lat': lat, 'lng': lng, 'type': 'moderate'});
+              uploadBumps.add({
+                'lat': lat,
+                'lng': lng,
+                'impact': dynamicZ.toStringAsFixed(2),
+                'type': 'moderate',
+              });
             }
           }
         }
 
-        setState(() {
-          _routePoints = importedRoute;
-          _bumpData = importedBumps;
+        // 推送至 Firebase 云端
+        await FirebaseFirestore.instance.collection('rides').add({
+          'timestamp': DateTime.now().toIso8601String(),
+          'route': uploadRoute,
+          'bumps': uploadBumps,
         });
 
-        // 导入成功后，触发保存逻辑
-        await _saveMapState();
-
-        if (importedRoute.isNotEmpty) {
-          _mapController.move(importedRoute.first, 18.0);
-        }
-
+        setState(() => syncStatus = "🟢 Live Sync Active");
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Load Success: Found ${importedBumps.length} bumps!'),
+          const SnackBar(
+            content: Text('Uploaded to Cloud!'),
             backgroundColor: Colors.green,
           ),
         );
       }
     } catch (e) {
-      print("Import Error: $e");
+      setState(() => syncStatus = "🔴 Upload Failed");
+      print("Upload Error: $e");
     }
   }
 
-  Future<void> _saveAndShareCsv() async {
+  // 结束录制，保存 CSV 到手机并同步到云端
+  Future<void> _stopRecordAndSync() async {
     if (_dataLog.isEmpty) return;
+
+    setState(() {
+      _isRecording = false;
+      syncStatus = "⏳ Uploading to Cloud...";
+    });
+
+    // 1. 本地保存 CSV 备份
     List<List<dynamic>> csvData = [
       ["Timestamp", "Acc_X", "Acc_Y", "Acc_Z", "Latitude", "Longitude"],
     ];
@@ -318,20 +357,58 @@ class _SensorDisplayAppState extends State<SensorDisplayApp> {
       ], text: 'Exported Road Quality Data');
     } catch (e) {}
 
-    setState(() => _dataLog.clear());
+    // 2. 解析此次骑行数据并推送至云端
+    List<Map<String, double>> uploadRoute = [];
+    List<Map<String, dynamic>> uploadBumps = [];
+
+    for (var row in _dataLog) {
+      double accZ = double.tryParse(row[3].toString()) ?? -0.98;
+      double lat = row[4];
+      double lng = row[5];
+
+      if (lat == 0.0 && lng == 0.0) continue;
+
+      uploadRoute.add({'lat': lat, 'lng': lng});
+      double dynamicZ = (accZ.abs() - 0.98).abs();
+      if (dynamicZ >= 0.45) {
+        uploadBumps.add({
+          'lat': lat,
+          'lng': lng,
+          'impact': dynamicZ.toStringAsFixed(2),
+          'type': 'severe',
+        });
+      } else if (dynamicZ >= 0.30 && dynamicZ < 0.45) {
+        uploadBumps.add({
+          'lat': lat,
+          'lng': lng,
+          'impact': dynamicZ.toStringAsFixed(2),
+          'type': 'moderate',
+        });
+      }
+    }
+
+    try {
+      await FirebaseFirestore.instance.collection('rides').add({
+        'timestamp': DateTime.now().toIso8601String(),
+        'route': uploadRoute,
+        'bumps': uploadBumps,
+      });
+      setState(() => syncStatus = "🟢 Live Sync Active");
+    } catch (e) {
+      setState(() => syncStatus = "🔴 Sync Failed");
+    }
+
+    _dataLog.clear();
   }
 
-  // 动态生成 Marker 图标集合
   List<Marker> _buildMapMarkers() {
     List<Marker> markers = [
-      // 当前位置的蓝点
       Marker(
         point: LatLng(_currentLat, _currentLng),
         child: const Icon(Icons.my_location, color: Colors.blue, size: 25),
       ),
     ];
 
-    // 添加所有缓存的颠簸点
     for (var bump in _bumpData) {
       bool isSevere = bump['type'] == 'severe';
       markers.add(
@@ -354,7 +431,16 @@ class _SensorDisplayAppState extends State<SensorDisplayApp> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text("Bone-Shaker Map"),
+        title: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            const Text("Bone-Shaker Map", style: TextStyle(fontSize: 18)),
+            Text(
+              syncStatus,
+              style: const TextStyle(fontSize: 12, color: Colors.greenAccent),
+            ),
+          ],
+        ),
         backgroundColor: Colors.blueGrey[900],
         foregroundColor: Colors.white,
       ),
@@ -392,9 +478,7 @@ class _SensorDisplayAppState extends State<SensorDisplayApp> {
                     ),
                   ],
                 ),
-                MarkerLayer(
-                  markers: _buildMapMarkers(), // 调用动态生成的标记函数
-                ),
+                MarkerLayer(markers: _buildMapMarkers()),
               ],
             ),
           ),
@@ -416,11 +500,10 @@ class _SensorDisplayAppState extends State<SensorDisplayApp> {
                 const SizedBox(height: 10),
                 Row(
                   children: [
-                    // --- 清除按钮 (垃圾桶) ---
                     Expanded(
                       flex: 1,
                       child: ElevatedButton(
-                        onPressed: _isRecording ? null : _clearMapState,
+                        onPressed: _isRecording ? null : _clearCloudData,
                         style: ElevatedButton.styleFrom(
                           backgroundColor: Colors.grey[700],
                           foregroundColor: Colors.white,
@@ -430,21 +513,21 @@ class _SensorDisplayAppState extends State<SensorDisplayApp> {
                       ),
                     ),
                     const SizedBox(width: 5),
-                    // --- 导入按钮 (文件上传) ---
                     Expanded(
                       flex: 1,
                       child: ElevatedButton(
-                        onPressed: _isRecording ? null : _importCsvAndPlot,
+                        onPressed: _isRecording
+                            ? null
+                            : _importCsvAndUploadToCloud,
                         style: ElevatedButton.styleFrom(
                           backgroundColor: Colors.indigo,
                           foregroundColor: Colors.white,
                           padding: const EdgeInsets.symmetric(vertical: 15),
                         ),
-                        child: const Icon(Icons.file_upload),
+                        child: const Icon(Icons.cloud_upload),
                       ),
                     ),
                     const SizedBox(width: 5),
-                    // --- 开始按钮 ---
                     Expanded(
                       flex: 2,
                       child: ElevatedButton.icon(
@@ -466,18 +549,12 @@ class _SensorDisplayAppState extends State<SensorDisplayApp> {
                       ),
                     ),
                     const SizedBox(width: 5),
-                    // --- 停止与保存按钮 ---
                     Expanded(
                       flex: 2,
                       child: ElevatedButton.icon(
-                        onPressed: !_isRecording
-                            ? null
-                            : () {
-                                setState(() => _isRecording = false);
-                                _saveAndShareCsv();
-                              },
+                        onPressed: !_isRecording ? null : _stopRecordAndSync,
                         icon: const Icon(Icons.stop, size: 18),
-                        label: const Text("SAVE"),
+                        label: const Text("SAVE & SYNC"),
                         style: ElevatedButton.styleFrom(
                           backgroundColor: Colors.red[600],
                           foregroundColor: Colors.white,

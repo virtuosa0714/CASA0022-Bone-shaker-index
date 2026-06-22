@@ -41,6 +41,7 @@
             display: flex;
             gap: 10px;
             align-items: center;
+            flex-wrap: wrap;
         }
 
         .btn {
@@ -69,6 +70,23 @@
             background-color: #b71c1c;
         }
 
+        .btn-route {
+            background-color: #9C27B0;
+        }
+
+        .btn-route:hover {
+            background-color: #7B1FA2;
+        }
+
+        .btn-clear-route {
+            background-color: #00E676;
+            color: #000;
+        }
+
+        .btn-clear-route:hover {
+            background-color: #00C853;
+        }
+
         #csvFileInput {
             display: none;
         }
@@ -76,6 +94,11 @@
         #map {
             flex: 1;
             width: 100%;
+            cursor: default;
+        }
+
+        .crosshair-cursor {
+            cursor: crosshair !important;
         }
 
         .legend {
@@ -108,6 +131,16 @@
             padding: 5px 10px;
             border-radius: 4px;
         }
+
+        #route-toast {
+            display: none;
+            background: #FFC107;
+            color: black;
+            padding: 8px 15px;
+            border-radius: 20px;
+            font-weight: bold;
+            font-size: 14px;
+        }
     </style>
 </head>
 
@@ -116,10 +149,14 @@
     <div id="header">
         <h1>☁️ Bone-Shaker Cloud Dashboard</h1>
         <div class="controls">
+            <div id="route-toast">📍 Click on the map to set START point...</div>
             <span id="sync-status">🟢 Live Sync Active</span>
-            <button class="btn btn-upload" onclick="document.getElementById('csvFileInput').click()">📂 Upload Ride
+
+            <button class="btn btn-clear-route" onclick="clearOptimalRoute()">🧹 Clear Green Line</button>
+            <button class="btn btn-route" id="btnPlanRoute" onclick="toggleRouteMode()">🗺️ Plan Smooth Route</button>
+            <button class="btn btn-upload" onclick="document.getElementById('csvFileInput').click()">📂 Upload
                 CSV</button>
-            <button class="btn btn-clear" onclick="clearCloudMap()">🗑️ Clear Cloud Data</button>
+            <button class="btn btn-clear" onclick="clearCloudMap()">🗑️ Clear Data</button>
             <input type="file" id="csvFileInput" accept=".csv" onchange="handleFileUpload(event)">
         </div>
     </div>
@@ -129,7 +166,7 @@
     <script>
         // ================= 1. 初始化 Firebase =================
         const firebaseConfig = {
-            apiKey: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            apiKey: "AIzaSyDuNN0dClnYs9atOrwdhBlmBWIRnRcNXxg",
             authDomain: "boneshaker-cloud.firebaseapp.com",
             projectId: "boneshaker-cloud",
             storageBucket: "boneshaker-cloud.firebasestorage.app",
@@ -137,13 +174,10 @@
             appId: "1:642805589117:web:afa31003e17fedeafafd14",
             measurementId: "G-65LLHV6424"
         };
-
-        if (!firebase.apps.length) {
-            firebase.initializeApp(firebaseConfig);
-        }
+        if (!firebase.apps.length) firebase.initializeApp(firebaseConfig);
         const db = firebase.firestore();
 
-        // ================= 2. 初始化地图 =================
+        // ================= 2. 初始化地图与精细化图层 =================
         const map = L.map('map').setView([51.536, -0.012], 15);
         L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
             attribution: '&copy; OpenStreetMap contributors'
@@ -153,126 +187,287 @@
         legend.onAdd = function () {
             const div = L.DomUtil.create('div', 'legend');
             div.innerHTML = `
-                <div class="legend-item"><span class="dot" style="background: red;"></span> Severe Bump (>= 0.65g)</div>
-                <div class="legend-item"><span class="dot" style="background: orange;"></span> Moderate Bump (>= 0.45g)</div>
-                <div class="legend-item"><div style="width:12px; height:3px; background:blue; display:inline-block;"></div> Route</div>
+                <div class="legend-item"><span class="dot" style="background: red;"></span> Severe Bump</div>
+                <div class="legend-item"><span class="dot" style="background: orange;"></span> Moderate Bump</div>
+                <div class="legend-item"><div style="width:12px; height:3px; background:blue; display:inline-block;"></div> All Surveyed Routes</div>
+                <div class="legend-item"><div style="width:12px; height:4px; background:#00E676; display:inline-block;"></div> Optimal Smooth Path</div>
             `;
             return div;
         };
         legend.addTo(map);
 
-        let mapLayers = L.featureGroup().addTo(map);
+        // 🔥 核心改动：分离图层，控制层级
+        let baseLinesLayer = L.featureGroup().addTo(map);   // 最底层：所有蓝色的测绘轨迹
+        let optimalPathLayer = L.featureGroup().addTo(map); // 中间层：绿色的平稳规划路线
+        let bumpsLayer = L.featureGroup().addTo(map);       // 最顶层：红黄色的颠簸点
+        let markersLayer = L.featureGroup().addTo(map);     // 绝对顶层：起点/终点图钉
 
-        // ================= 3. 实时云端监听 =================
+        let allRidesData = [];
+        let graph = {};
+        let nodes = {};
+
+        let routingMode = false;
+        let routeStep = 0;
+        let startNodeId = null;
+        let endNodeId = null;
+
+        // ================= 3. 实时监听 =================
         db.collection("rides").onSnapshot((snapshot) => {
-            mapLayers.clearLayers();
-            let allRoutePointsForBounds = [];
+            allRidesData = [];
+            snapshot.forEach((doc) => allRidesData.push(doc.data()));
+            buildTopologyGraph();
+            renderBaseMap();
+        });
 
-            snapshot.forEach((doc) => {
-                const data = doc.data();
+        // ================= 4. 构建路网与虚拟桥接 =================
+        function buildTopologyGraph() {
+            graph = {};
+            nodes = {};
 
-                // 【独立画线】
-                if (data.route && data.route.length > 0) {
-                    const safeRoute = data.route.map(p => [p.lat, p.lng]);
-                    L.polyline(safeRoute, { color: '#2196F3', weight: 4, opacity: 0.7 }).addTo(mapLayers);
-                    allRoutePointsForBounds = allRoutePointsForBounds.concat(safeRoute);
-                }
-
-                // 【画点】
-                if (data.bumps && data.bumps.length > 0) {
-                    data.bumps.forEach(b => {
-                        const icon = b.type === 'severe' ? { radius: 8, color: 'red', fill: '#ff0000' } : { radius: 5, color: 'orange', fill: '#ffa500' };
-                        L.circleMarker([b.lat, b.lng], {
-                            radius: icon.radius, color: icon.color, fillColor: icon.fill, fillOpacity: 0.8, weight: 1
-                        }).bindPopup(`<b>${b.type === 'severe' ? 'Severe Bump' : 'Moderate Bump'}</b><br>Impact: ${b.impact}g`).addTo(mapLayers);
+            allRidesData.forEach(ride => {
+                if (!ride.route || ride.route.length < 2) return;
+                let pointPenalties = new Array(ride.route.length).fill(0);
+                if (ride.bumps) {
+                    ride.bumps.forEach(b => {
+                        let minD = Infinity, minIdx = -1;
+                        ride.route.forEach((pt, i) => {
+                            let d = calcDistKm(pt.lat, pt.lng, b.lat, b.lng);
+                            if (d < minD) { minD = d; minIdx = i; }
+                        });
+                        if (minIdx !== -1) pointPenalties[minIdx] += (b.type === 'severe' ? 0.5 : 0.2);
                     });
                 }
+                let prevNodeId = null, accumulatedPenalty = 0;
+                ride.route.forEach((pt, i) => {
+                    let nodeId = pt.lat.toFixed(4) + '_' + pt.lng.toFixed(4);
+                    if (!nodes[nodeId]) nodes[nodeId] = { lat: pt.lat, lng: pt.lng };
+                    accumulatedPenalty += pointPenalties[i];
+
+                    if (prevNodeId && prevNodeId !== nodeId) {
+                        let dist = calcDistKm(nodes[prevNodeId].lat, nodes[prevNodeId].lng, nodes[nodeId].lat, nodes[nodeId].lng);
+                        let weight = dist + accumulatedPenalty;
+                        if (!graph[prevNodeId]) graph[prevNodeId] = {};
+                        if (!graph[nodeId]) graph[nodeId] = {};
+                        if (!graph[prevNodeId][nodeId] || weight < graph[prevNodeId][nodeId].weight) {
+                            graph[prevNodeId][nodeId] = { weight: weight };
+                            graph[nodeId][prevNodeId] = { weight: weight };
+                        }
+                        prevNodeId = nodeId;
+                        accumulatedPenalty = 0;
+                    } else if (!prevNodeId) prevNodeId = nodeId;
+                });
             });
 
-            if (allRoutePointsForBounds.length > 0) {
-                const combinedLine = L.polyline(allRoutePointsForBounds);
-                map.fitBounds(combinedLine.getBounds(), { padding: [50, 50] });
+            // 虚拟桥接 (缝合断裂路段)
+            let nodeArray = Object.keys(nodes);
+            const MAX_GAP_KM = 0.03;
+
+            for (let i = 0; i < nodeArray.length; i++) {
+                let idA = nodeArray[i];
+                let ptA = nodes[idA];
+
+                for (let j = i + 1; j < nodeArray.length; j++) {
+                    let idB = nodeArray[j];
+                    let ptB = nodes[idB];
+
+                    if (Math.abs(ptA.lat - ptB.lat) > 0.002 || Math.abs(ptA.lng - ptB.lng) > 0.003) continue;
+                    if (graph[idA] && graph[idA][idB]) continue;
+
+                    let dist = calcDistKm(ptA.lat, ptA.lng, ptB.lat, ptB.lng);
+
+                    if (dist < MAX_GAP_KM) {
+                        let weight = dist * 1.5;
+                        if (!graph[idA]) graph[idA] = {};
+                        if (!graph[idB]) graph[idB] = {};
+
+                        graph[idA][idB] = { weight: weight, isVirtual: true };
+                        graph[idB][idA] = { weight: weight, isVirtual: true };
+                    }
+                }
+            }
+        }
+
+        // ================= 5. 最短路径寻路 =================
+        function findShortestPath(startId, endId) {
+            let distances = {}, prev = {}, pq = new Set();
+            for (let node in graph) { distances[node] = Infinity; pq.add(node); }
+            distances[startId] = 0;
+
+            while (pq.size > 0) {
+                let minNode = null;
+                for (let node of pq) if (minNode === null || distances[node] < distances[minNode]) minNode = node;
+                if (minNode === null || distances[minNode] === Infinity || minNode === endId) break;
+                pq.delete(minNode);
+                for (let neighbor in graph[minNode]) {
+                    if (!pq.has(neighbor)) continue;
+                    let alt = distances[minNode] + graph[minNode][neighbor].weight;
+                    if (alt < distances[neighbor]) { distances[neighbor] = alt; prev[neighbor] = minNode; }
+                }
+            }
+            let pathCoords = [], curr = endId;
+            if (prev[curr] || curr === startId) {
+                while (curr) { pathCoords.unshift([nodes[curr].lat, nodes[curr].lng]); curr = prev[curr]; }
+            }
+            return pathCoords;
+        }
+
+        // ================= 6. 交互控制 =================
+        function toggleRouteMode() {
+            routingMode = !routingMode;
+            const btn = document.getElementById('btnPlanRoute');
+            const toast = document.getElementById('route-toast');
+
+            if (routingMode) {
+                btn.innerText = "❌ Cancel Routing";
+                btn.style.backgroundColor = "#F44336";
+                document.getElementById('map').classList.add('crosshair-cursor');
+                toast.style.display = "block";
+                toast.innerText = "📍 Click on the map to set START point...";
+                routeStep = 1;
+                clearOptimalRoute();
+                // 仅虚化蓝线，让点依然清晰
+                baseLinesLayer.setStyle({ opacity: 0.3 });
+            } else {
+                btn.innerText = "🗺️ Plan Smooth Route";
+                btn.style.backgroundColor = "#9C27B0";
+                document.getElementById('map').classList.remove('crosshair-cursor');
+                toast.style.display = "none";
+                routeStep = 0;
+                clearOptimalRoute();
+                baseLinesLayer.setStyle({ opacity: 0.7 });
+            }
+        }
+
+        function clearOptimalRoute() {
+            optimalPathLayer.clearLayers();
+            markersLayer.clearLayers();
+            if (routingMode) {
+                routeStep = 1;
+                document.getElementById('route-toast').innerText = "📍 Click on the map to set START point...";
+            }
+        }
+
+        function getClosestNode(lat, lng) {
+            let closest = null, minDist = Infinity;
+            for (let id in nodes) {
+                let d = calcDistKm(lat, lng, nodes[id].lat, nodes[id].lng);
+                if (d < minDist) { minDist = d; closest = id; }
+            }
+            if (minDist > 0.2) return null;
+            return closest;
+        }
+
+        map.on('click', function (e) {
+            if (!routingMode) return;
+            const toast = document.getElementById('route-toast');
+
+            let clickedNodeId = getClosestNode(e.latlng.lat, e.latlng.lng);
+            if (!clickedNodeId) {
+                alert("Too far from surveyed routes! Please click closer to the blue lines.");
+                return;
+            }
+
+            if (routeStep === 1) {
+                optimalPathLayer.clearLayers();
+                markersLayer.clearLayers();
+                startNodeId = clickedNodeId;
+                L.marker([nodes[startNodeId].lat, nodes[startNodeId].lng]).addTo(markersLayer).bindPopup("Start").openPopup();
+                toast.innerText = "🏁 Now click to set DESTINATION...";
+                routeStep = 2;
+            } else if (routeStep === 2) {
+                endNodeId = clickedNodeId;
+                L.marker([nodes[endNodeId].lat, nodes[endNodeId].lng]).addTo(markersLayer).bindPopup("End");
+                toast.innerText = "⏳ Calculating optimal smooth route...";
+
+                setTimeout(() => {
+                    let bestPath = findShortestPath(startNodeId, endNodeId);
+                    if (bestPath.length > 0) {
+                        // 画出绿色最优路线
+                        L.polyline(bestPath, { color: '#00E676', weight: 8, opacity: 0.9, lineJoin: 'round' }).addTo(optimalPathLayer);
+
+                        // 🔥 强制置顶功能：把红黄颠簸点和起点终点拉到最上层！
+                        bumpsLayer.bringToFront();
+                        markersLayer.bringToFront();
+
+                        toast.innerText = "✅ Route found! (Virtual bridges used if necessary)";
+                    } else {
+                        toast.innerText = "⚠️ Still too far. Try picking points closer to each other.";
+                    }
+                    routeStep = 1;
+                }, 100);
             }
         });
 
-        // ================= 4. 处理 CSV (全新阈值 + 1.5秒防抖) =================
+        // ================= 7. 基础底图渲染 =================
+        function renderBaseMap() {
+            // 分别清除两个图层的数据
+            baseLinesLayer.clearLayers();
+            bumpsLayer.clearLayers();
+
+            let allRoutePointsForBounds = [];
+            allRidesData.forEach((data) => {
+                if (data.route && data.route.length > 0) {
+                    const safeRoute = data.route.map(p => [p.lat, p.lng]);
+                    // 蓝线加入 baseLinesLayer
+                    L.polyline(safeRoute, { color: '#2196F3', weight: 4, opacity: 0.7 }).addTo(baseLinesLayer);
+                    allRoutePointsForBounds = allRoutePointsForBounds.concat(safeRoute);
+                }
+                if (data.bumps && data.bumps.length > 0) {
+                    data.bumps.forEach(b => {
+                        const icon = b.type === 'severe' ? { radius: 6, color: 'red', fill: '#ff0000' } : { radius: 4, color: 'orange', fill: '#ffa500' };
+                        // 红黄点加入 bumpsLayer
+                        L.circleMarker([b.lat, b.lng], { radius: icon.radius, color: icon.color, fillColor: icon.fill, fillOpacity: 0.8, weight: 1 }).addTo(bumpsLayer);
+                    });
+                }
+            });
+            if (allRoutePointsForBounds.length > 0) map.fitBounds(L.polyline(allRoutePointsForBounds).getBounds(), { padding: [50, 50] });
+        }
+
+        function calcDistKm(lat1, lon1, lat2, lon2) {
+            const R = 6371;
+            const dLat = (lat2 - lat1) * Math.PI / 180;
+            const dLon = (lon2 - lon1) * Math.PI / 180;
+            const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+            return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+        }
+
         function handleFileUpload(event) {
             const file = event.target.files[0];
             if (!file) return;
-
             const statusUI = document.getElementById('sync-status');
-            statusUI.innerText = "⏳ Uploading to Cloud...";
-            statusUI.style.color = "orange";
-
+            statusUI.innerText = "⏳ Uploading...";
             const reader = new FileReader();
             reader.onload = function (e) {
                 const rows = e.target.result.split(/\r?\n/);
-                let routePoints = [];
-                let bumps = [];
-                let lastBumpTime = 0; // 🔥新增防抖冷却计时
-
+                let routePoints = [], bumps = [], lastBumpTime = 0;
                 for (let i = 1; i < rows.length; i++) {
                     const cols = rows[i].split(',');
                     if (cols.length >= 6) {
-                        const timeStr = cols[0];
-                        const accZ = parseFloat(cols[3]);
-                        const lat = parseFloat(cols[4]);
-                        const lng = parseFloat(cols[5]);
-
+                        const timeStr = cols[0], accZ = parseFloat(cols[3]), lat = parseFloat(cols[4]), lng = parseFloat(cols[5]);
                         if (!isNaN(lat) && !isNaN(lng) && lat !== 0 && lng !== 0) {
                             routePoints.push({ lat: lat, lng: lng });
-
-                            const dynamicZ = Math.abs(Math.abs(accZ) - 0.98);
-                            const currentTime = new Date(timeStr).getTime();
-
-                            // 🔥核心过滤：达到震动阈值，并且距离上次记录超过了 1500 毫秒
+                            const dynamicZ = Math.abs(Math.abs(accZ) - 0.98), currentTime = new Date(timeStr).getTime();
                             if (dynamicZ >= 0.45 && (currentTime - lastBumpTime > 1500)) {
-                                if (dynamicZ >= 0.65) {
-                                    bumps.push({ lat: lat, lng: lng, impact: dynamicZ.toFixed(2), type: 'severe' });
-                                } else {
-                                    bumps.push({ lat: lat, lng: lng, impact: dynamicZ.toFixed(2), type: 'moderate' });
-                                }
-                                lastBumpTime = currentTime; // 重置冷却时间
+                                bumps.push({ lat: lat, lng: lng, impact: dynamicZ.toFixed(2), type: dynamicZ >= 0.65 ? 'severe' : 'moderate' });
+                                lastBumpTime = currentTime;
                             }
                         }
                     }
                 }
-
-                if (routePoints.length === 0) {
-                    alert("No valid data found in CSV!");
-                    statusUI.innerText = "🔴 Upload Failed";
-                    statusUI.style.color = "red";
-                    return;
-                }
-
-                db.collection("rides").add({
-                    timestamp: new Date().toISOString(),
-                    route: routePoints,
-                    bumps: bumps
-                }).then(() => {
+                db.collection("rides").add({ timestamp: new Date().toISOString(), route: routePoints, bumps: bumps }).then(() => {
                     statusUI.innerText = "🟢 Live Sync Active";
-                    statusUI.style.color = "#4CAF50";
-                }).catch(error => alert("Upload failed! Error: " + error.message));
-
+                });
                 event.target.value = '';
             };
             reader.readAsText(file);
         }
 
-        // ================= 5. 清除数据 =================
         function clearCloudMap() {
-            if (confirm("Are you sure you want to delete ALL ride data from the cloud?")) {
-                const statusUI = document.getElementById('sync-status');
-                statusUI.innerText = "⏳ Deleting...";
-                statusUI.style.color = "orange";
-
+            if (confirm("Delete ALL ride data?")) {
                 db.collection("rides").get().then((querySnapshot) => {
                     let batch = db.batch();
                     querySnapshot.forEach((doc) => batch.delete(doc.ref));
                     return batch.commit();
-                }).then(() => {
-                    statusUI.innerText = "🟢 Live Sync Active";
-                    statusUI.style.color = "#4CAF50";
                 });
             }
         }

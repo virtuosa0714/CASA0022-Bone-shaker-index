@@ -219,48 +219,68 @@
             renderBaseMap();
         });
 
-        // ================= 4. 构建路网与虚拟桥接 =================
+        // ================= 4. 构建路网 (纯粹数点版) =================
         function buildTopologyGraph() {
             graph = {};
             nodes = {};
 
+            // 第一步：初始化节点
+            allRidesData.forEach(ride => {
+                if (!ride.route) return;
+                ride.route.forEach(pt => {
+                    let nodeId = pt.lat.toFixed(4) + '_' + pt.lng.toFixed(4);
+                    if (!nodes[nodeId]) {
+                        nodes[nodeId] = { lat: pt.lat, lng: pt.lng, penalty: 0 };
+                    }
+                });
+            });
+
+            // 第二步：纯粹的点数烙印
+            allRidesData.forEach(ride => {
+                if (!ride.bumps) return;
+                ride.bumps.forEach(b => {
+                    let minD = Infinity;
+                    let closestNodeId = null;
+                    for (let id in nodes) {
+                        let d = calcDistKm(nodes[id].lat, nodes[id].lng, b.lat, b.lng);
+                        if (d < minD) { minD = d; closestNodeId = id; }
+                    }
+                    // 只要有坑就记数：红点记 10 分，黄点记 1 分
+                    if (closestNodeId && minD < 0.02) {
+                        nodes[closestNodeId].penalty += (b.type === 'severe' ? 10 : 3);
+                    }
+                });
+            });
+
+            // 第三步：连线并计算绝对代价（抛弃距离！）
             allRidesData.forEach(ride => {
                 if (!ride.route || ride.route.length < 2) return;
-                let pointPenalties = new Array(ride.route.length).fill(0);
-                if (ride.bumps) {
-                    ride.bumps.forEach(b => {
-                        let minD = Infinity, minIdx = -1;
-                        ride.route.forEach((pt, i) => {
-                            let d = calcDistKm(pt.lat, pt.lng, b.lat, b.lng);
-                            if (d < minD) { minD = d; minIdx = i; }
-                        });
-                        if (minIdx !== -1) pointPenalties[minIdx] += (b.type === 'severe' ? 0.5 : 0.2);
-                    });
-                }
-                let prevNodeId = null, accumulatedPenalty = 0;
-                ride.route.forEach((pt, i) => {
+                let prevNodeId = null;
+                ride.route.forEach(pt => {
                     let nodeId = pt.lat.toFixed(4) + '_' + pt.lng.toFixed(4);
-                    if (!nodes[nodeId]) nodes[nodeId] = { lat: pt.lat, lng: pt.lng };
-                    accumulatedPenalty += pointPenalties[i];
 
                     if (prevNodeId && prevNodeId !== nodeId) {
                         let dist = calcDistKm(nodes[prevNodeId].lat, nodes[prevNodeId].lng, nodes[nodeId].lat, nodes[nodeId].lng);
-                        let weight = dist + accumulatedPenalty;
+
+                        // 🔥 核心修改：代价几乎完全等于两端节点的颠簸分数总和！
+                        // 距离 dist 被乘以了 0.0001，意味着绕路 10 公里才等于 0.001 分，完全无法撼动 1 个黄点（1分）的影响力。
+                        let weight = nodes[prevNodeId].penalty + nodes[nodeId].penalty + (dist * 0.00001);
+
                         if (!graph[prevNodeId]) graph[prevNodeId] = {};
                         if (!graph[nodeId]) graph[nodeId] = {};
+
                         if (!graph[prevNodeId][nodeId] || weight < graph[prevNodeId][nodeId].weight) {
                             graph[prevNodeId][nodeId] = { weight: weight };
                             graph[nodeId][prevNodeId] = { weight: weight };
                         }
-                        prevNodeId = nodeId;
-                        accumulatedPenalty = 0;
-                    } else if (!prevNodeId) prevNodeId = nodeId;
+                    }
+                    prevNodeId = nodeId;
                 });
             });
 
-            // 虚拟桥接 (缝合断裂路段)
+            // 第四步：虚拟桥接 (400米无视地形穿透)
             let nodeArray = Object.keys(nodes);
-            const MAX_GAP_KM = 0.03;
+            const MAX_GAP_KM = 0.40;
 
             for (let i = 0; i < nodeArray.length; i++) {
                 let idA = nodeArray[i];
@@ -276,7 +296,8 @@
                     let dist = calcDistKm(ptA.lat, ptA.lng, ptB.lat, ptB.lng);
 
                     if (dist < MAX_GAP_KM) {
-                        let weight = dist * 1.5;
+                        // 虚拟桥的代价：相当于走一次虚拟桥只等同于微不足道的距离分，优先保证连通
+                        let weight = nodes[idA].penalty + nodes[idB].penalty + (dist * 0.0002);
                         if (!graph[idA]) graph[idA] = {};
                         if (!graph[idB]) graph[idB] = {};
 
